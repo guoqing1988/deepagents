@@ -20,7 +20,8 @@ Uses the [Chinook database](https://github.com/lerocha/chinook-database) - a sam
 ### Prerequisites
 
 - Python 3.11 or higher
-- Anthropic API key ([get one here](https://console.anthropic.com/))
+- API key for your chosen LLM provider (Anthropic, OpenAI, etc.)
+- (Optional) MySQL database if not using the default SQLite
 - (Optional) LangSmith API key for tracing ([sign up here](https://smith.langchain.com/))
 
 ### Installation
@@ -48,87 +49,70 @@ source .venv/bin/activate  # On Windows: .venv\Scripts\activate
 uv pip install -e .
 ```
 
-1. Set up your environment variables:
+1. Set up your configuration in `config.yaml`:
+
+```yaml
+model:
+  provider: "deepseek" # or any other provider
+  model: "deepseek-chat"
+  temperature: 0
+  base_url: "https://api.deepseek.com"
+  api_key: "${DEEPSEEK_API_KEY}" # Read from .env
+
+database:
+  type: "mysql" # or "sqlite"
+  mysql:
+    host: "${MYSQL_HOST:-localhost}"
+    port: "${MYSQL_PORT:-3306}"
+    user: "${MYSQL_USER:-root}"
+    password: "${MYSQL_PASSWORD}" # Read from .env
+    database: "${MYSQL_DATABASE}"
+```
+
+1. Set up your environment variables in `.env`:
 
 ```bash
 cp .env.example .env
-# Edit .env and add your API keys
+# Add your provider API keys and database credentials:
+# DEEPSEEK_API_KEY=your_key
+# MYSQL_PASSWORD=your_password
 ```
 
-Required in `.env`:
+### Features
 
-```
-ANTHROPIC_API_KEY=your_anthropic_api_key_here
-```
-
-Optional:
-
-```
-LANGCHAIN_TRACING_V2=true
-LANGSMITH_ENDPOINT=https://api.smith.langchain.com
-LANGCHAIN_API_KEY=your_langsmith_api_key_here
-LANGCHAIN_PROJECT=text2sql-deepagent
-```
-
-## Usage
-
-### Command Line Interface
-
-Run the agent from the command line with a natural language question:
-
-```bash
-python agent.py "What are the top 5 best-selling artists?"
-```
-
-```bash
-python agent.py "Which employee generated the most revenue by country?"
-```
-
-```bash
-python agent.py "How many customers are from Canada?"
-```
-
-### Programmatic Usage
-
-You can also use the agent in your Python code:
-
-```python
-from agent import create_sql_deep_agent
-
-# Create the agent
-agent = create_sql_deep_agent()
-
-# Ask a question
-result = agent.invoke({
-    "messages": [{"role": "user", "content": "What are the top 5 best-selling artists?"}]
-})
-
-print(result["messages"][-1].content)
-```
-
-## How the Deep Agent Works
+- **Beautiful CLI**: Claude Code-inspired interface with dynamic icons, spinners, and colors.
+- **Streaming Output**: Watch the agent think and respond in real-time with Markdown formatting.
+- **Process Visibility**: Minimalist tool-call tracking with status indicators (`› running`).
+- **Secure Configuration**: Sensitive information is managed via environment variables.
 
 ### Architecture
 
-```
+```text
 User Question
-     ↓
+      ↓
+Deep Agent (with streaming)
+      ├─ config.yaml (Environment variable substitution)
+      ├─ init_chat_model (Unified LLM access)
+      ├─ write_todos (plan the approach)
+      ├─ SQL Tools (Output visible in real-time)
+```
+
+```text
+User Question
+      ↓
 Deep Agent (with planning)
-     ├─ write_todos (plan the approach)
-     ├─ SQL Tools
-     │  ├─ list_tables
-     │  ├─ get_schema
-     │  ├─ query_checker
-     │  └─ execute_query
-     ├─ Filesystem Tools (optional)
-     │  ├─ ls
-     │  ├─ read_file
-     │  ├─ write_file
-     │  └─ edit_file
-     └─ Subagent Spawning (optional)
-     ↓
-SQLite Database (Chinook)
-     ↓
+      ├─ config.yaml (Model & DB settings)
+      ├─ init_chat_model (Unified LLM access)
+      ├─ write_todos (plan the approach)
+      ├─ SQL Tools
+      │  ├─ list_tables
+      │  ├─ get_schema
+      │  ├─ query_checker
+      │  └─ execute_query
+      └─ Subagent Spawning (optional)
+      ↓
+Database (SQLite or MySQL)
+      ↓
 Formatted Answer
 ```
 
@@ -154,7 +138,7 @@ The agent sees skill descriptions in its context but only loads the full SKILL.m
 
 ### Simple Query
 
-```
+```text
 "How many customers are from Canada?"
 ```
 
@@ -162,7 +146,7 @@ The agent will directly query and return the count.
 
 ### Complex Query with Planning
 
-```
+```text
 "Which employee generated the most revenue and from which countries?"
 ```
 
@@ -178,47 +162,19 @@ The agent will:
 
 The Deep Agent shows its reasoning process:
 
-```
+```text
 Question: Which employee generated the most revenue by country?
 
 [Planning Step]
-Using write_todos:
-- [ ] List tables in database
-- [ ] Examine Employee and Invoice schemas
-- [ ] Plan multi-table JOIN query
-- [ ] Execute and aggregate by employee and country
-- [ ] Format results
-
-[Execution Steps]
-1. Listing tables...
-2. Getting schema for: Employee, Invoice, InvoiceLine, Customer
-3. Generating SQL query...
-4. Executing query...
-5. Formatting results...
-
-[Final Answer]
-Employee Jane Peacock (ID: 3) generated the most revenue...
-Top countries: USA ($1000), Canada ($500)...
+...
 ```
 
 ## Project Structure
 
-```
+```text
 text-to-sql-agent/
 ├── agent.py                      # Core Deep Agent implementation with CLI
-├── AGENTS.md                     # Agent identity and general instructions (always loaded)
-├── skills/                       # Specialized workflows (loaded on-demand)
-│   ├── query-writing/
-│   │   └── SKILL.md             # SQL query writing workflow
-│   └── schema-exploration/
-│       └── SKILL.md             # Database structure discovery workflow
-├── chinook.db                    # Sample SQLite database (downloaded, gitignored)
-├── pyproject.toml                # Project configuration and dependencies
-├── uv.lock                       # Locked dependency versions
-├── .env.example                  # Environment variable template
-├── .gitignore                    # Git ignore rules
-├── text-to-sql-langsmith-trace.png  # LangSmith trace example image
-└── README.md                     # This file
+...
 ```
 
 ## Requirements
@@ -243,11 +199,9 @@ All dependencies are specified in `pyproject.toml`:
 2. Create an API key from your account settings
 3. Add these variables to your `.env` file:
 
-```
+```text
 LANGCHAIN_TRACING_V2=true
-LANGSMITH_ENDPOINT=https://api.smith.langchain.com
-LANGCHAIN_API_KEY=your_langsmith_api_key_here
-LANGCHAIN_PROJECT=text2sql-deepagent
+...
 ```
 
 ### What You'll See

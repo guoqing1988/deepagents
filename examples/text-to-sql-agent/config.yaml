@@ -1,0 +1,27 @@
+# Model configuration
+# provider: "anthropic", "openai", "google_genai", etc.
+# model: the model name to use
+# temperature: sampling temperature (0 for deterministic results)
+model:
+  provider: "deepseek"
+  model: "deepseek-chat"
+  temperature: 0
+  base_url: "https://api.deepseek.com"
+  api_key: "${DEEPSEEK_API_KEY}"
+
+# Database configuration
+# type: "sqlite" or "mysql"
+database:
+  type: "mysql"
+
+  # SQLite specific configuration
+  sqlite:
+    path: "chinook.db"
+
+  # MySQL specific configuration
+  mysql:
+    host: "${MYSQL_HOST:-localhost}"
+    port: "${MYSQL_PORT:-3306}"
+    user: "${MYSQL_USER:-root}"
+    password: "${MYSQL_PASSWORD:-password}"
+    database: "${MYSQL_DATABASE:-metamedia_ai_v2}"
