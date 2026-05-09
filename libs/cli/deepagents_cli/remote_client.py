@@ -1,9 +1,9 @@
 """Remote agent client — thin wrapper around LangGraph's `RemoteGraph`.
 
 Delegates streaming, state management, and SSE handling to
-`langgraph.pregel.remote.RemoteGraph`. The only added logic is converting raw
-message dicts from the server into LangChain message objects that the CLI's
-Textual adapter expects.
+`langgraph.pregel.remote.RemoteGraph`. This wrapper converts streamed message
+dicts into LangChain message objects for the CLI's Textual adapter, but leaves
+state snapshots in the server's serialized form.
 """
 
 from __future__ import annotations
@@ -44,8 +44,9 @@ class RemoteAgent:
 
     Wraps `langgraph.pregel.remote.RemoteGraph` which handles SSE parsing,
     stream-mode negotiation (`messages-tuple`), namespace extraction, and
-    interrupt detection. This class adds only message-object conversion for the
-    Textual adapter and thread-ID normalization.
+    interrupt detection. This class adds streamed message-object conversion for
+    the Textual adapter and thread-ID normalization. State snapshots are
+    returned as provided by the server.
     """
 
     def __init__(
@@ -186,6 +187,10 @@ class RemoteAgent:
         All other errors (network, auth, 500) are logged at WARNING and
         re-raised so callers can handle them.
 
+        Unlike `astream`, message values are not deserialized; callers may
+        receive serialized message dicts in `values["messages"]` from the
+        server.
+
         Args:
             config: Config with `configurable.thread_id`.
 
@@ -220,7 +225,8 @@ class RemoteAgent:
         """Update the state of a thread.
 
         Exceptions from the underlying graph (server/network errors) are logged
-        at WARNING level and then re-raised so callers can handle them.
+        at DEBUG level and then re-raised so callers can decide how to surface
+        them (callers typically log at WARNING with a friendlier message).
 
         Args:
             config: Config with `configurable.thread_id`.
@@ -235,7 +241,7 @@ class RemoteAgent:
         try:
             await graph.aupdate_state(_prepare_config(config), values)
         except Exception:
-            logger.warning(
+            logger.debug(
                 "Failed to update state for thread %s", thread_id, exc_info=True
             )
             raise

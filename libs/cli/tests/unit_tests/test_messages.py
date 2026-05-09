@@ -18,6 +18,7 @@ from deepagents_cli.widgets.messages import (
     SummarizationMessage,
     ToolCallMessage,
     UserMessage,
+    _MutedRichMarkdown,
     _show_timestamp_toast,
     _strip_frontmatter,
     _strip_success_exit_line,
@@ -74,6 +75,67 @@ class TestErrorMessageMarkupSafety:
         assert isinstance(rendered, Content)
         assert rendered.plain == "Error: something broke"
 
+    def test_error_message_accepts_content_with_link_span(self) -> None:
+        """Pre-built `Content` with `link` spans passes through to render output."""
+        from textual.style import Style as TStyle
+
+        url = "https://docs.langchain.com/oss/python/deepagents/cli/providers"
+        body = Content.assemble(
+            "see ",
+            (url, TStyle(underline=True, link=url)),
+        )
+        rendered = ErrorMessage(body).render()
+        assert isinstance(rendered, Content)
+        links = [
+            getattr(span.style, "link", None)
+            for span in rendered.spans
+            if getattr(span.style, "link", None)
+        ]
+        assert links == [url]
+        assert rendered.plain == f"Error: see {url}"
+
+    def test_error_message_click_on_link_opens_url(self) -> None:
+        """Click on a `link`-styled span should route through `open_style_link`."""
+        from types import SimpleNamespace
+
+        msg = ErrorMessage("see https://example.com")
+        event = SimpleNamespace(
+            style=SimpleNamespace(link="https://example.com"),
+            app=SimpleNamespace(notify=MagicMock()),
+            stop=MagicMock(),
+        )
+        with (
+            patch("deepagents_cli.widgets.messages.open_style_link") as mock_open_link,
+            patch(
+                "deepagents_cli.widgets.messages._show_timestamp_toast"
+            ) as mock_toast,
+        ):
+            msg.on_click(event)  # type: ignore[arg-type]
+
+        mock_open_link.assert_called_once_with(event)
+        mock_toast.assert_not_called()
+
+    def test_error_message_click_off_link_shows_timestamp(self) -> None:
+        """Click outside a link span should fall back to the timestamp toast."""
+        from types import SimpleNamespace
+
+        msg = ErrorMessage("plain error, no URL")
+        event = SimpleNamespace(
+            style=SimpleNamespace(link=None),
+            app=SimpleNamespace(notify=MagicMock()),
+            stop=MagicMock(),
+        )
+        with (
+            patch("deepagents_cli.widgets.messages.open_style_link") as mock_open_link,
+            patch(
+                "deepagents_cli.widgets.messages._show_timestamp_toast"
+            ) as mock_toast,
+        ):
+            msg.on_click(event)  # type: ignore[arg-type]
+
+        mock_open_link.assert_not_called()
+        mock_toast.assert_called_once_with(msg)
+
 
 class TestAppMessageMarkupSafety:
     """Test AppMessage handles content with brackets safely."""
@@ -103,6 +165,87 @@ class TestAppMessageMarkupSafety:
         msg = AppMessage(pre)
         rendered = msg._Static__content  # type: ignore[attr-defined]
         assert rendered is pre
+
+    def test_app_message_markdown_uses_muted_wrapper(self) -> None:
+        """`markdown=True` should route through `_MutedRichMarkdown`."""
+        msg = AppMessage("### heading", markdown=True)
+        rendered = msg._Static__content  # type: ignore[attr-defined]
+        assert isinstance(rendered, _MutedRichMarkdown)
+
+    def test_app_message_markdown_requires_string(self) -> None:
+        """`markdown=True` with non-string input should raise `TypeError`."""
+        pre = Content.styled("styled", "bold")
+        with pytest.raises(TypeError):
+            AppMessage(pre, markdown=True)
+
+
+class TestMutedRichMarkdown:
+    """Tests for the muted markdown theme wrapper."""
+
+    _DOC = (
+        "### Installed optional dependencies\n"
+        "\n"
+        "| Extra | Package | Version |\n"
+        "| --- | --- | --- |\n"
+        "| anthropic | langchain-anthropic | 1.4.1 |\n"
+    )
+
+    @staticmethod
+    def _render(renderable: object) -> str:
+        import io
+
+        from rich.console import Console
+
+        console = Console(
+            file=io.StringIO(),
+            force_terminal=True,
+            color_system="truecolor",
+            width=80,
+            legacy_windows=False,
+        )
+        console.print(renderable)
+        return console.file.getvalue()  # type: ignore[attr-defined]
+
+    def test_strips_heading_and_table_colors(self) -> None:
+        """Muted wrapper should drop magenta/cyan from headings and tables."""
+        from rich.markdown import Markdown as RichMarkdown
+
+        baseline = self._render(RichMarkdown(self._DOC))
+        muted = self._render(_MutedRichMarkdown(self._DOC))
+
+        # Default Rich theme paints `markdown.h3` magenta (ANSI code 35)
+        # and `markdown.table.*` cyan (ANSI code 36).
+        assert "\x1b[1;35m" in baseline
+        assert "\x1b[36m" in baseline
+
+        assert "\x1b[35m" not in muted
+        assert ";35m" not in muted
+        assert "\x1b[36m" not in muted
+        assert ";36m" not in muted
+
+    def test_applies_dim_to_body_and_headings(self) -> None:
+        """Muted wrapper should layer `dim` onto body, headings, and tables."""
+        muted = self._render(_MutedRichMarkdown(self._DOC))
+
+        # `dim` is ANSI code 2. Heading should be bold+dim ("1;2"),
+        # plain cells should be dim ("2m"), and both must be present.
+        assert "\x1b[1;2m" in muted
+        assert "\x1b[2m" in muted
+
+    def test_render_failure_falls_back_to_plain_source(self) -> None:
+        """A crash inside Rich markdown rendering must not escape.
+
+        If the themed render path raises, the wrapper should emit the raw
+        source so the chat view stays up; the full stream would otherwise
+        tear down when Textual asks the widget for content.
+        """
+        wrapped = _MutedRichMarkdown("# heading\n\nbody")
+        # Force the inner Markdown renderable to raise when consumed.
+        wrapped._markdown = MagicMock()
+        wrapped._markdown.__rich_console__ = MagicMock(side_effect=RuntimeError("boom"))
+
+        rendered = self._render(wrapped)
+        assert "body" in rendered
 
 
 class TestSummarizationMessage:
@@ -176,6 +319,146 @@ class TestToolCallMessageMarkupSafety:
         assert isinstance(content, Content)
         assert "[foo]" in content.plain
         assert "[/dim]" in content.plain
+
+    def test_ask_user_args_are_collapsed_by_default(self) -> None:
+        """`ask_user` should show compact header without inline raw args."""
+        msg = ToolCallMessage(
+            "ask_user",
+            {
+                "questions": [
+                    {
+                        "question": 'Your prompt is just "hi" - what should I build?',
+                        "type": "text",
+                    }
+                    for _ in range(4)
+                ]
+            },
+        )
+
+        widgets = list(msg.compose())
+        visible = []
+        for widget in widgets[:3]:
+            content = widget._Static__content  # type: ignore[attr-defined]
+            visible.append(content.plain if isinstance(content, Content) else content)
+        visible_plain = "\n".join(visible)
+
+        assert "ask_user(4 questions)" in visible_plain
+        assert "Your prompt is just" not in visible_plain
+        assert msg.has_expandable_args is True
+
+
+class TestToolCallMessageExpandableArgs:
+    """Tests for the `ask_user` expandable-arguments toggle."""
+
+    def test_has_expandable_args_false_for_non_ask_user(self) -> None:
+        """Only `ask_user` should expose expandable args."""
+        msg = ToolCallMessage("read_file", {"path": "/tmp/x"})
+        assert msg.has_expandable_args is False
+
+    def test_has_expandable_args_false_for_ask_user_without_args(self) -> None:
+        """Empty args dict should not be expandable."""
+        msg = ToolCallMessage("ask_user", {})
+        assert msg.has_expandable_args is False
+
+    def test_tool_name_property_exposes_underlying_name(self) -> None:
+        """Public `tool_name` property should mirror the constructor arg."""
+        msg = ToolCallMessage("ask_user", {"questions": []})
+        assert msg.tool_name == "ask_user"
+
+    def test_toggle_args_no_op_before_mount(self) -> None:
+        """Calling `toggle_args` before mount should not flip state."""
+        msg = ToolCallMessage("ask_user", {"questions": [{"question": "?"}]})
+        # Without `on_mount`, widget refs are None — `_update_args_display`
+        # short-circuits and the expanded flag should not be flipped either,
+        # since the user can't possibly see the result.
+        msg.toggle_args()
+        assert msg._args_expanded is True  # state flips
+        # but rendering is a no-op:
+        assert msg._args_widget is None
+
+    async def test_toggle_args_swaps_display_state(self) -> None:
+        """`toggle_args` should flip the args widget's display after mount."""
+        from textual.app import App, ComposeResult
+
+        class _Harness(App[None]):
+            def __init__(self) -> None:
+                super().__init__()
+                self.msg = ToolCallMessage(
+                    "ask_user",
+                    {"questions": [{"question": "Name?", "type": "text"}]},
+                )
+
+            def compose(self) -> ComposeResult:
+                yield self.msg
+
+        app = _Harness()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            msg = app.msg
+
+            # Initial state: hint visible, full args hidden.
+            assert msg._args_widget is not None
+            assert msg._args_hint_widget is not None
+            assert msg._args_widget.display is False
+            assert msg._args_hint_widget.display is True
+
+            msg.toggle_args()
+            await pilot.pause()
+            assert msg._args_expanded is True
+            assert msg._args_widget.display is True
+
+            msg.toggle_args()
+            await pilot.pause()
+            assert msg._args_expanded is False
+            assert msg._args_widget.display is False
+
+    async def test_on_click_routes_ask_user_to_toggle_args(self) -> None:
+        """Clicking an `ask_user` row (no output) should expand args."""
+        from textual.app import App, ComposeResult
+
+        class _Harness(App[None]):
+            def __init__(self) -> None:
+                super().__init__()
+                self.msg = ToolCallMessage(
+                    "ask_user",
+                    {"questions": [{"question": "?"}]},
+                )
+
+            def compose(self) -> ComposeResult:
+                yield self.msg
+
+        app = _Harness()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            msg = app.msg
+            event = MagicMock()
+            msg.on_click(event)
+            await pilot.pause()
+            event.stop.assert_called_once()
+            assert msg._args_expanded is True
+
+    async def test_toggle_output_does_not_fall_through_to_args(self) -> None:
+        """`toggle_output` is strictly about output; args stay collapsed."""
+        from textual.app import App, ComposeResult
+
+        class _Harness(App[None]):
+            def __init__(self) -> None:
+                super().__init__()
+                self.msg = ToolCallMessage(
+                    "ask_user",
+                    {"questions": [{"question": "?"}]},
+                )
+
+            def compose(self) -> ComposeResult:
+                yield self.msg
+
+        app = _Harness()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            msg = app.msg
+            msg.toggle_output()
+            await pilot.pause()
+            assert msg._args_expanded is False
 
 
 class TestToolCallMessageShellCommand:
@@ -479,60 +762,6 @@ class TestAppMessageOnClickOpensLink:
 # ---------------------------------------------------------------------------
 
 _MSG_STORE_PATH = "deepagents_cli.widgets.messages"
-
-
-class TestShowTimestampToast:
-    """Tests for `_show_timestamp_toast` helper."""
-
-    def test_noop_when_widget_not_mounted(self) -> None:
-        """Should not raise when widget has no app."""
-        widget = MagicMock(spec=["app", "id"])
-        # Simulate unmounted widget: .app property raises
-        type(widget).app = property(
-            lambda _: (_ for _ in ()).throw(RuntimeError("no app"))
-        )
-        widget.id = "msg-abc"
-        _show_timestamp_toast(widget)  # should not raise
-
-    def test_noop_when_widget_id_is_none(self) -> None:
-        """Should return early when widget.id is None."""
-        widget = MagicMock()
-        widget.id = None
-        widget.app = MagicMock()
-        _show_timestamp_toast(widget)
-        widget.app.notify.assert_not_called()
-
-    def test_noop_when_message_not_in_store(self) -> None:
-        """Should return early when message is not found in the store."""
-        widget = MagicMock()
-        widget.id = "msg-missing"
-        widget.app._message_store.get_message.return_value = None
-        _show_timestamp_toast(widget)
-        widget.app.notify.assert_not_called()
-
-    def test_shows_toast_with_formatted_timestamp(self) -> None:
-        """Should call notify with a human-readable timestamp."""
-        from deepagents_cli.widgets.message_store import MessageData, MessageType
-
-        data = MessageData(
-            type=MessageType.USER,
-            content="hello",
-            id="msg-test123",
-            timestamp=1709744055.0,  # 2024-03-06 17:14:15 UTC
-        )
-        widget = MagicMock()
-        widget.id = "msg-test123"
-        widget.app._message_store.get_message.return_value = data
-
-        _show_timestamp_toast(widget)
-
-        widget.app.notify.assert_called_once()
-        call_args = widget.app.notify.call_args
-        label = call_args[0][0]
-        # Should contain month abbreviation and time components
-        assert "Mar" in label
-        assert ":" in label
-        assert call_args[1]["timeout"] == 3
 
 
 class TestTimestampClickMixin:

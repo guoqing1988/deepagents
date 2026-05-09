@@ -9,7 +9,7 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 from time import time
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, ClassVar
 
 from textual import on
 from textual.containers import Vertical
@@ -32,6 +32,7 @@ from deepagents_cli.widgets._links import open_style_link
 from deepagents_cli.widgets.diff import compose_diff_lines
 
 if TYPE_CHECKING:
+    from rich.console import Console as RichConsole, ConsoleOptions, RenderResult
     from textual.app import ComposeResult
     from textual.timer import Timer
     from textual.widgets import Markdown
@@ -40,7 +41,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def _show_timestamp_toast(widget: Static | Vertical) -> None:
+def _show_timestamp_toast(widget: Static | Vertical) -> None:  # noqa: ARG001  # temporarily disabled
     """Show a toast with the message's creation timestamp.
 
     No-ops silently if the widget is not mounted or has no associated message
@@ -49,21 +50,23 @@ def _show_timestamp_toast(widget: Static | Vertical) -> None:
     Args:
         widget: The message widget whose timestamp to display.
     """
-    from datetime import UTC, datetime
-
-    try:
-        app = widget.app
-    except Exception:  # noqa: BLE001  # Textual raises when widget has no app
-        return
-    if not widget.id:
-        return
-    store = app._message_store  # type: ignore[attr-defined]
-    data = store.get_message(widget.id)
-    if not data:
-        return
-    dt = datetime.fromtimestamp(data.timestamp, tz=UTC).astimezone()
-    label = f"{dt:%b} {dt.day}, {dt.hour % 12 or 12}:{dt:%M:%S} {dt:%p}"
-    app.notify(label, timeout=3)
+    # TODO: temporarily disabled — uncomment to restore click-to-show-timestamp
+    return  # early return while feature is disabled
+    # from datetime import UTC, datetime  # noqa: ERA001
+    #
+    # try:  # noqa: ERA001
+    #     app = widget.app  # noqa: ERA001
+    # except Exception:  # Textual raises when widget has no app  # noqa: ERA001
+    #     return  # noqa: ERA001
+    # if not widget.id:
+    #     return  # noqa: ERA001
+    # store = app._message_store  # noqa: ERA001
+    # data = store.get_message(widget.id)  # noqa: ERA001
+    # if not data:
+    #     return  # noqa: ERA001
+    # dt = datetime.fromtimestamp(data.timestamp, tz=UTC).astimezone()  # noqa: ERA001
+    # label = f"{dt:%b} {dt.day}, {dt.hour % 12 or 12}:{dt:%M:%S} {dt:%p}"  # noqa: ERA001, E501
+    # app.notify(label, timeout=3)  # noqa: ERA001
 
 
 class _TimestampClickMixin:
@@ -135,6 +138,7 @@ _TOOLS_WITH_HEADER_INFO: set[str] = {
     # Web tools
     "web_search",
     "fetch_url",
+    "ask_user",
     # Agent tools
     "task",
     "write_todos",
@@ -784,8 +788,11 @@ class ToolCallMessage(Vertical):
         self._status = "pending"  # Waiting for approval or auto-approve
         self._output: str = ""
         self._expanded: bool = False
+        self._args_expanded: bool = False
         # Widget references (set in on_mount)
         self._status_widget: Static | None = None
+        self._args_widget: Static | None = None
+        self._args_hint_widget: Static | None = None
         self._preview_widget: Static | None = None
         self._hint_widget: Static | None = None
         self._full_widget: Static | None = None
@@ -830,6 +837,10 @@ class ToolCallMessage(Vertical):
                     Content.from_markup("[dim]($args)[/dim]", args=args_str),
                     classes="tool-args",
                 )
+        # Collapsed argument detail for tools whose args are too noisy inline.
+        # Mounted for every tool but only populated when `has_expandable_args` is True.
+        yield Static("", classes="tool-args", id="args-full")
+        yield Static("", classes="tool-output-hint", id="args-hint")
         # Status - shows running animation while pending, then final status
         yield Static("", classes="tool-status", id="status")
         # Output area - hidden initially, shown when output is set
@@ -843,14 +854,19 @@ class ToolCallMessage(Vertical):
             self.add_class("-ascii")
 
         self._status_widget = self.query_one("#status", Static)
+        self._args_widget = self.query_one("#args-full", Static)
+        self._args_hint_widget = self.query_one("#args-hint", Static)
         self._preview_widget = self.query_one("#output-preview", Static)
         self._hint_widget = self.query_one("#output-hint", Static)
         self._full_widget = self.query_one("#output-full", Static)
         # Hide everything initially - status only shown when running or on error/reject
         self._status_widget.display = False
+        self._args_widget.display = False
+        self._args_hint_widget.display = False
         self._preview_widget.display = False
         self._hint_widget.display = False
         self._full_widget.display = False
+        self._update_args_display()
 
         # Restore deferred state if this widget was hydrated from data
         self._restore_deferred_state()
@@ -1029,17 +1045,26 @@ class ToolCallMessage(Vertical):
             self._status_widget.display = True
 
     def toggle_output(self) -> None:
-        """Toggle between preview and full output display."""
+        """Toggle expansion of the tool's preview/full output."""
         if not self._output:
             return
         self._expanded = not self._expanded
         self._update_output_display()
 
+    def toggle_args(self) -> None:
+        """Toggle display of collapsed tool arguments."""
+        if not self.has_expandable_args:
+            return
+        self._args_expanded = not self._args_expanded
+        self._update_args_display()
+
     def on_click(self, event: Click) -> None:
-        """Toggle output expansion, or show timestamp if no output."""
+        """Toggle output/argument expansion, or show timestamp if nothing expands."""
         event.stop()  # Prevent click from bubbling up and scrolling
         if self._output:
             self.toggle_output()
+        elif self.has_expandable_args:
+            self.toggle_args()
         else:
             _show_timestamp_toast(self)
 
@@ -1552,6 +1577,67 @@ class ToolCallMessage(Vertical):
         """
         return bool(self._output)
 
+    @property
+    def tool_name(self) -> str:
+        """Public read-only accessor for the underlying tool name."""
+        return self._tool_name
+
+    @property
+    def has_expandable_args(self) -> bool:
+        """Whether the tool's args are large enough to deserve a collapsible block.
+
+        Only `ask_user` qualifies today: its `questions` payload is too noisy to
+        render inline, but users still need a way to inspect it.
+        """
+        return self._tool_name == "ask_user" and bool(self._args)
+
+    def _format_args_detail(self) -> Content:
+        """Render tool arguments as an indented `Content` block.
+
+        Falls back to `str(self._args)` (with a visible marker) when JSON
+        serialization fails — `default=str` already handles most non-serializable
+        values, so reaching the fallback indicates a deeper issue worth logging.
+
+        Returns:
+            Indented `Content` containing JSON-pretty-printed arguments, or a
+            marked fallback rendering on serialization failure.
+        """
+        try:
+            text = json.dumps(self._args, ensure_ascii=False, indent=2, default=str)
+        except (TypeError, ValueError) as exc:
+            logger.warning(
+                "ask_user args not JSON-serializable; using repr fallback: %r", exc
+            )
+            text = f"# (fallback rendering)\n{self._args!s}"
+        lines = Content(text).split("\n")
+        return Content("\n").join(Content.assemble("  ", line) for line in lines)
+
+    def _update_args_display(self) -> None:
+        """Update the collapsed/expanded argument display."""
+        if self._args_widget is None or self._args_hint_widget is None:
+            # Toggle invoked before on_mount cached the refs; log so a regression
+            # that nulls them out post-mount doesn't appear as a silent no-op.
+            logger.debug("_update_args_display called before widget refs are cached")
+            return
+
+        if not self.has_expandable_args:
+            self._args_widget.display = False
+            self._args_hint_widget.display = False
+            return
+
+        if self._args_expanded:
+            self._args_widget.update(self._format_args_detail())
+            self._args_widget.display = True
+            self._args_hint_widget.update(
+                Content.styled("click or Ctrl+O to hide arguments", "dim italic")
+            )
+        else:
+            self._args_widget.display = False
+            self._args_hint_widget.update(
+                Content.styled("click or Ctrl+O to show arguments", "dim italic")
+            )
+        self._args_hint_widget.display = True
+
     def _filtered_args(self) -> dict[str, Any]:
         """Filter large tool args for display.
 
@@ -1655,14 +1741,14 @@ class ErrorMessage(_TimestampClickMixin, Static):
     """
     """Tinted background + left border to visually separate errors from output."""
 
-    def __init__(self, error: str, **kwargs: Any) -> None:
+    def __init__(self, error: str | Content, **kwargs: Any) -> None:
         """Initialize an error message.
 
         Args:
-            error: The error message
-            **kwargs: Additional arguments passed to parent
+            error: Plain string, or `Content` for pre-styled bodies
+                (e.g. with `link`-styled spans).
+            **kwargs: Additional arguments passed to parent.
         """
-        # Store raw content for serialization
         self._content = error
         super().__init__(**kwargs)
 
@@ -1670,7 +1756,7 @@ class ErrorMessage(_TimestampClickMixin, Static):
         """Render with theme-aware colors.
 
         Returns:
-            Styled error content with theme-appropriate color.
+            Styled error content; spans on a `Content` body are preserved.
         """
         colors = theme.get_theme_colors(self)
         return Content.assemble(
@@ -1683,6 +1769,66 @@ class ErrorMessage(_TimestampClickMixin, Static):
         if is_ascii_mode():
             colors = theme.get_theme_colors(self)
             self.styles.border_left = ("ascii", colors.error)
+
+    def on_click(self, event: Click) -> None:
+        """Open clicked URLs; otherwise show the timestamp toast."""
+        if event.style.link:
+            open_style_link(event)
+            return
+        _show_timestamp_toast(self)
+
+
+class _MutedRichMarkdown:
+    """Render Rich markdown to match `AppMessage`'s muted-italic base.
+
+    Plain `AppMessage` strings render as `dim italic` via `Content.styled`
+    plus the widget's CSS. Rich's default markdown theme paints h2-h4
+    magenta and table headers/borders cyan, and doesn't apply `dim` to
+    paragraphs, so markdown blocks look visually distinct. This wrapper:
+
+    - Applies a `rich.theme.Theme` while rendering that strips the stock
+        colors while keeping structural emphasis (bold/underline/italic), and
+    - Layers `dim` over the whole document via `rich.styled.Styled` so
+        body text matches the `dim italic` baseline used elsewhere.
+    """
+
+    _THEME_OVERRIDES: ClassVar[dict[str, str]] = {
+        "markdown.h1": "bold underline",
+        "markdown.h2": "bold underline",
+        "markdown.h3": "bold",
+        "markdown.h4": "italic",
+        "markdown.table.header": "bold",
+        "markdown.table.border": "",
+    }
+
+    def __init__(self, markup: str) -> None:
+        from rich.markdown import Markdown as RichMarkdown
+
+        self._markdown = RichMarkdown(markup)
+        self._markup = markup
+
+    def __rich_console__(  # noqa: PLW3201  # Rich renderable protocol
+        self, console: RichConsole, options: ConsoleOptions
+    ) -> RenderResult:
+        from rich.styled import Styled
+        from rich.theme import Theme
+
+        theme = Theme(self._THEME_OVERRIDES, inherit=True)
+        try:
+            with console.use_theme(theme):
+                yield from Styled(self._markdown, "dim").__rich_console__(
+                    console, options
+                )
+        except Exception:
+            # Rich markdown or theme application blew up on malformed input.
+            # Fall back to the raw source so the chat view keeps rendering.
+            logger.warning(
+                "Rich markdown rendering failed; falling back to plain text",
+                exc_info=True,
+            )
+            yield from Styled(self._markup, "dim italic").__rich_console__(
+                console, options
+            )
 
 
 class AppMessage(Static):
@@ -1704,20 +1850,39 @@ class AppMessage(Static):
     }
     """
 
-    def __init__(self, message: str | Content, **kwargs: Any) -> None:
+    def __init__(
+        self,
+        message: str | Content,
+        *,
+        markdown: bool = False,
+        **kwargs: Any,
+    ) -> None:
         """Initialize a system message.
 
         Args:
             message: The system message as a string or pre-styled `Content`.
-            **kwargs: Additional arguments passed to parent
+            markdown: When `True`, render `message` as markdown via Rich's
+                markdown renderer (tables, headings, bold, etc.).
+
+                Requires a string message — `Content` objects already carry
+                their own structure.
+            **kwargs: Additional arguments passed to parent.
+
+        Raises:
+            TypeError: If `markdown=True` is combined with a non-string
+                `message`.
         """
-        # Store raw content for serialization
         self._content = message
-        rendered = (
-            message
-            if isinstance(message, Content)
-            else Content.styled(message, "dim italic")
-        )
+        self._is_markdown = markdown
+        if markdown:
+            if not isinstance(message, str):
+                msg = "AppMessage(markdown=True) requires a string message"
+                raise TypeError(msg)
+            rendered = _MutedRichMarkdown(message)
+        elif isinstance(message, Content):
+            rendered = message
+        else:
+            rendered = Content.styled(message, "dim italic")
         super().__init__(rendered, **kwargs)
 
     def on_click(self, event: Click) -> None:
